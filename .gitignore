@@ -1,0 +1,5 @@
+/agent-lab
+bin/
+*.exe
+.env
+*.log
