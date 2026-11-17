@@ -388,6 +388,121 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ---------- 流式 + 工具 ----------
+
+// 一次流式调用：先判断这段输出是"工具调用"还是"最终回答"
+// 返回: 完整文本, 是否已经把内容推给客户端, 错误
+func streamOnce(ctx context.Context, msgs []llmMsg, sseSend func(any)) (string, bool, error) {
+	body, err := json.Marshal(llmReq{
+		Model:       llmModel,
+		Messages:    msgs,
+		Temperature: 0,
+		MaxTokens:   512,
+		Stream:      true,
+	})
+	if err != nil {
+		return "", false, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		llmBaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := llmClient.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", false, fmt.Errorf("llm status %d: %s", resp.StatusCode, b)
+	}
+
+	var sb strings.Builder
+	forwarded := false
+	decided := false
+
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			break
+		}
+
+		var chunk llmStreamChunk
+		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.Content == "" {
+			continue
+		}
+
+		piece := chunk.Choices[0].Delta.Content
+		sb.WriteString(piece)
+
+		if !decided {
+			decided = true
+			// 首段以 { 开头 → 判定为工具调用，静默攒着，不推给客户端
+			if !strings.HasPrefix(strings.TrimSpace(sb.String()), "{") {
+				forwarded = true
+			}
+		}
+		if forwarded {
+			sseSend(map[string]string{"delta": piece})
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return sb.String(), forwarded, err
+	}
+	return sb.String(), forwarded, nil
+}
+
+// 流式版工具循环：中间步骤静默，最终回答逐字推给客户端
+func runAgentStream(ctx context.Context, history []llmMsg, sseSend func(any)) (string, error) {
+	const maxSteps = 4
+	for step := 0; step < maxSteps; step++ {
+		out, forwarded, err := streamOnce(ctx, buildMessages(history), sseSend)
+		if err != nil {
+			return "", err
+		}
+		history = append(history, llmMsg{Role: "assistant", Content: out})
+
+		tc, ok := parseToolCall(out)
+		if !ok {
+			if !forwarded && strings.TrimSpace(out) != "" {
+				sseSend(map[string]string{"delta": out})
+			}
+			return out, nil
+		}
+
+		res, terr := execTool(ctx, tc)
+		if terr != nil {
+			// 模型吐了个不存在的工具：当成普通回答，别陷入循环
+			if strings.Contains(terr.Error(), "unknown tool") {
+				if !forwarded && strings.TrimSpace(out) != "" {
+					sseSend(map[string]string{"delta": out})
+				}
+				return out, nil
+			}
+			res = "工具执行失败: " + terr.Error()
+		}
+		log.Printf("stream step %d tool=%s result=%s", step, tc.Tool, res)
+		sseSend(map[string]any{"tool": tc.Tool, "result": res})
+
+		history = append(history, llmMsg{Role: "user", Content: "工具结果: " + res})
+	}
+	return "", fmt.Errorf("too many tool steps")
+}
+
 // ---------- 流式 ----------
 
 func chatStreamHandler(w http.ResponseWriter, r *http.Request) {
@@ -421,85 +536,25 @@ func chatStreamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	history = append(history, llmMsg{Role: "user", Content: req.Message})
 
-	body, err := json.Marshal(llmReq{
-		Model:       llmModel,
-		Messages:    buildMessages(history),
-		Temperature: 0,
-		MaxTokens:   512,
-		Stream:      true,
-	})
-	if err != nil {
-		http.Error(w, "marshal: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		llmBaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "new request: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := llmClient.Do(httpReq)
-	if err != nil {
-		http.Error(w, "llm call: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		http.Error(w, fmt.Sprintf("llm status %d: %s", resp.StatusCode, b), http.StatusBadGateway)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
-	var sb strings.Builder // 边转发边攒，结束时入库
-
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimPrefix(line, "data: ")
-		if payload == "[DONE]" {
-			break
-		}
-
-		var chunk llmStreamChunk
-		if json.Unmarshal([]byte(payload), &chunk) != nil {
-			continue
-		}
-		if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.Content == "" {
-			continue
-		}
-
-		piece := chunk.Choices[0].Delta.Content
-		sb.WriteString(piece)
-
-		out, _ := json.Marshal(map[string]string{"delta": piece})
-		fmt.Fprintf(w, "data: %s\n\n", out)
+	sseSend := func(v any) {
+		b, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
 	}
-	if err := sc.Err(); err != nil {
-		log.Println("scan stream:", err)
+
+	reply, err := runAgentStream(ctx, history, sseSend)
+	if err != nil {
+		sseSend(map[string]string{"error": err.Error()})
+		return
 	}
 
 	sctx, scancel := storeCtx(r)
 	defer scancel()
-	if err := appendTurn(sctx, sid, req.Message, sb.String()); err != nil {
+	if err := appendTurn(sctx, sid, req.Message, reply); err != nil {
 		log.Println("appendTurn:", err)
 	}
 
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"done":true,"session_id":%q}`, sid))
-	flusher.Flush()
+	sseSend(map[string]any{"done": true, "session_id": sid})
 }
 
 // ---------- 入口 ----------
