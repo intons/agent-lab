@@ -61,7 +61,18 @@ type llmStreamChunk struct {
 	} `json:"choices"`
 }
 
-const systemPrompt = "你是大模型推理与 GPU 性能方向的工程师，回答简洁、准确，优先使用术语的本义。"
+const systemPrompt = `你是大模型推理与 GPU 性能方向的工程师。
+
+【工具】
+- now()：返回当前时间
+- kv_count(key)：返回 Redis 中某个键的元素个数
+
+【规则】
+1. 需要工具时，只输出一行 JSON，禁止输出任何其他字符（不要解释、不要 markdown 代码块、不要句号）：
+   用户：现在几点 → 你：{"tool":"now","args":{}}
+   用户：sess:s1 有几条消息 → 你：{"tool":"kv_count","args":{"key":"sess:s1"}}
+2. 收到以「工具结果:」开头的消息后，再用自然语言回答。
+3. 不需要工具时，直接回答，不要输出 JSON。`
 
 var (
 	llmBaseURL = env("LLM_BASE_URL", "http://127.0.0.1:8001/v1")
@@ -142,6 +153,121 @@ func storeCtx(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
 }
 
+// ---------- 工具调用 ----------
+
+type toolCall struct {
+	Tool string          `json:"tool"`
+	Args json.RawMessage `json:"args"`
+}
+
+// 从模型输出里抠出 JSON（容忍代码块、前后废话、多余空白）
+func parseToolCall(s string) (*toolCall, bool) {
+	s = strings.TrimSpace(s)
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end <= start {
+		return nil, false
+	}
+	var tc toolCall
+	if err := json.Unmarshal([]byte(s[start:end+1]), &tc); err != nil {
+		return nil, false
+	}
+	if strings.TrimSpace(tc.Tool) == "" {
+		return nil, false
+	}
+	return &tc, true
+}
+
+func execTool(ctx context.Context, tc *toolCall) (string, error) {
+	switch strings.TrimSpace(tc.Tool) {
+	case "now":
+		return time.Now().Format(time.RFC3339), nil
+	case "kv_count":
+		var a struct {
+			Key string `json:"key"`
+		}
+		_ = json.Unmarshal(tc.Args, &a)
+		if a.Key == "" {
+			return "", fmt.Errorf("key is required")
+		}
+		n, err := rdb.LLen(ctx, a.Key).Result()
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%d", n), nil
+	default:
+		return "", fmt.Errorf("unknown tool: %s", tc.Tool)
+	}
+}
+
+// 单次非流式调用
+func chatOnce(ctx context.Context, msgs []llmMsg) (string, error) {
+	body, err := json.Marshal(llmReq{
+		Model:       llmModel,
+		Messages:    msgs,
+		Temperature: 0,
+		MaxTokens:   512,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		llmBaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := llmClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("llm status %d: %s", resp.StatusCode, b)
+	}
+
+	var out llmResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.Error != nil {
+		return "", fmt.Errorf("llm error: %s", out.Error.Message)
+	}
+	if len(out.Choices) == 0 {
+		return "", fmt.Errorf("empty choices")
+	}
+	return out.Choices[0].Message.Content, nil
+}
+
+// 带工具循环的对话：模型要工具 → 执行 → 结果回填 → 再问一轮
+func runAgent(ctx context.Context, history []llmMsg) (string, error) {
+	const maxSteps = 4
+	for step := 0; step < maxSteps; step++ {
+		r, err := chatOnce(ctx, buildMessages(history))
+		if err != nil {
+			return "", err
+		}
+		history = append(history, llmMsg{Role: "assistant", Content: r})
+
+		tc, ok := parseToolCall(r)
+		if !ok {
+			return r, nil
+		}
+
+		res, terr := execTool(ctx, tc)
+		if terr != nil {
+			res = "工具执行失败: " + terr.Error()
+		}
+		log.Printf("step %d tool=%s result=%s", step, tc.Tool, res)
+		history = append(history, llmMsg{Role: "user", Content: "工具结果: " + res})
+	}
+	return "", fmt.Errorf("too many tool steps")
+}
+
 // ---------- 非流式 ----------
 
 func chatHandler(w http.ResponseWriter, r *http.Request) {
@@ -173,53 +299,11 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	history = append(history, llmMsg{Role: "user", Content: req.Message})
 
-	body, err := json.Marshal(llmReq{
-		Model:       llmModel,
-		Messages:    buildMessages(history),
-		Temperature: 0.7,
-		MaxTokens:   512,
-	})
+	reply, err := runAgent(ctx, history)
 	if err != nil {
-		http.Error(w, "marshal: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "agent: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		llmBaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "new request: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := llmClient.Do(httpReq)
-	if err != nil {
-		http.Error(w, "llm call: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		http.Error(w, fmt.Sprintf("llm status %d: %s", resp.StatusCode, b), http.StatusBadGateway)
-		return
-	}
-
-	var out llmResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		http.Error(w, "decode llm resp: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	if out.Error != nil {
-		http.Error(w, "llm error: "+out.Error.Message, http.StatusBadGateway)
-		return
-	}
-	if len(out.Choices) == 0 {
-		http.Error(w, "llm returned no choices", http.StatusBadGateway)
-		return
-	}
-
-	reply := out.Choices[0].Message.Content
 
 	sctx, scancel := storeCtx(r)
 	defer scancel()
@@ -273,7 +357,7 @@ func chatStreamHandler(w http.ResponseWriter, r *http.Request) {
 	body, err := json.Marshal(llmReq{
 		Model:       llmModel,
 		Messages:    buildMessages(history),
-		Temperature: 0.7,
+		Temperature: 0,
 		MaxTokens:   512,
 		Stream:      true,
 	})
