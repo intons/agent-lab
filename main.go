@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -61,18 +62,22 @@ type llmStreamChunk struct {
 	} `json:"choices"`
 }
 
-const systemPrompt = `你是大模型推理与 GPU 性能方向的工程师。
+const basePrompt = `你是大模型推理与 GPU 性能方向的工程师，回答简洁准确。
 
-【工具】
-- now()：返回当前时间
-- kv_count(key)：返回 Redis 中某个键的元素个数
+【可用工具】
+%TOOLS%
 
 【规则】
-1. 需要工具时，只输出一行 JSON，禁止输出任何其他字符（不要解释、不要 markdown 代码块、不要句号）：
-   用户：现在几点 → 你：{"tool":"now","args":{}}
-   用户：sess:s1 有几条消息 → 你：{"tool":"kv_count","args":{"key":"sess:s1"}}
+1. 需要工具时只输出一行 JSON，禁止任何其他字符（不要解释、不要 markdown 代码块、不要句号）：
+   {"tool":"now","args":{}}
+   {"tool":"kv_count","args":{"key":"sess:s1"}}
 2. 收到以「工具结果:」开头的消息后，再用自然语言回答。
-3. 不需要工具时，直接回答，不要输出 JSON。`
+3. 不需要工具时直接回答，不要输出 JSON。`
+
+// prompt 里的工具清单由注册表生成：加工具只改 tools 一处
+func systemPrompt() string {
+	return strings.Replace(basePrompt, "%TOOLS%", toolsPrompt(), 1)
+}
 
 var (
 	llmBaseURL = env("LLM_BASE_URL", "http://127.0.0.1:8001/v1")
@@ -143,7 +148,7 @@ func ensureSession(req *chatReq) string {
 
 func buildMessages(history []llmMsg) []llmMsg {
 	msgs := make([]llmMsg, 0, len(history)+1)
-	msgs = append(msgs, llmMsg{Role: "system", Content: systemPrompt})
+	msgs = append(msgs, llmMsg{Role: "system", Content: systemPrompt()})
 	msgs = append(msgs, history...)
 	return msgs
 }
@@ -151,6 +156,81 @@ func buildMessages(history []llmMsg) []llmMsg {
 // 落库用独立 context：客户端断开也要把已生成的半截答案存下来
 func storeCtx(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+}
+
+// ---------- 工具注册表 ----------
+
+type toolDef struct {
+	Name string
+	Desc string
+	Args string // 参数示例，用于自动生成 prompt
+	Run  func(ctx context.Context, args json.RawMessage) (string, error)
+}
+
+var tools = map[string]toolDef{
+	"now": {
+		Name: "now",
+		Desc: "返回当前时间（RFC3339，UTC）",
+		Args: `{}`,
+		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			return time.Now().UTC().Format(time.RFC3339), nil
+		},
+	},
+	"kv_count": {
+		Name: "kv_count",
+		Desc: "返回 Redis 中某个键（list）的元素个数",
+		Args: `{"key":"sess:s1"}`,
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			var a struct {
+				Key string `json:"key"`
+			}
+			if err := json.Unmarshal(args, &a); err != nil || a.Key == "" {
+				return "", fmt.Errorf("key is required")
+			}
+			n, err := rdb.LLen(ctx, a.Key).Result()
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%d", n), nil
+		},
+	},
+	"redis_get": {
+		Name: "redis_get",
+		Desc: "读取 Redis 中某个键的字符串值",
+		Args: `{"key":"foo"}`,
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			var a struct {
+				Key string `json:"key"`
+			}
+			if err := json.Unmarshal(args, &a); err != nil || a.Key == "" {
+				return "", fmt.Errorf("key is required")
+			}
+			v, err := rdb.Get(ctx, a.Key).Result()
+			if err == redis.Nil {
+				return "(键不存在)", nil
+			}
+			if err != nil {
+				return "", err
+			}
+			return v, nil
+		},
+	},
+}
+
+// 生成给模型看的工具清单（顺序固定，便于排查）
+func toolsPrompt() string {
+	names := make([]string, 0, len(tools))
+	for n := range tools {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	for _, n := range names {
+		t := tools[n]
+		fmt.Fprintf(&b, "- %s：%s，参数示例 %s\n", t.Name, t.Desc, t.Args)
+	}
+	return b.String()
 }
 
 // ---------- 工具调用 ----------
@@ -179,25 +259,12 @@ func parseToolCall(s string) (*toolCall, bool) {
 }
 
 func execTool(ctx context.Context, tc *toolCall) (string, error) {
-	switch strings.TrimSpace(tc.Tool) {
-	case "now":
-		return time.Now().Format(time.RFC3339), nil
-	case "kv_count":
-		var a struct {
-			Key string `json:"key"`
-		}
-		_ = json.Unmarshal(tc.Args, &a)
-		if a.Key == "" {
-			return "", fmt.Errorf("key is required")
-		}
-		n, err := rdb.LLen(ctx, a.Key).Result()
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("%d", n), nil
-	default:
-		return "", fmt.Errorf("unknown tool: %s", tc.Tool)
+	name := strings.TrimSpace(tc.Tool)
+	t, ok := tools[name]
+	if !ok {
+		return "", fmt.Errorf("unknown tool: %s", name)
 	}
+	return t.Run(ctx, tc.Args)
 }
 
 // 单次非流式调用
