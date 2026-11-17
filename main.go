@@ -72,7 +72,8 @@ const basePrompt = `你是大模型推理与 GPU 性能方向的工程师，回�
    {"tool":"now","args":{}}
    {"tool":"kv_count","args":{"key":"sess:s1"}}
 2. 收到以「工具结果:」开头的消息后，再用自然语言回答。
-3. 不需要工具时直接回答，不要输出 JSON。`
+3. 不需要工具时直接回答，不要输出 JSON。
+4. 只要调用过 doc_search，回答的最后必须单独一行输出：来源: <文件名>（文件名取自检索结果里的「来源=」）。`
 
 // prompt 里的工具清单由注册表生成：加工具只改 tools 一处
 func systemPrompt() string {
@@ -85,6 +86,14 @@ var (
 	llmClient  = &http.Client{} // 不设 Timeout，统一由每次请求的 context 控制
 	rdb        *redis.Client
 )
+
+func shorten(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n]) + "…"
+}
 
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -168,6 +177,12 @@ type toolDef struct {
 }
 
 var tools = map[string]toolDef{
+	"doc_search": {
+		Name: "doc_search",
+		Desc: "在本地文档库中检索相关段落，返回带来源的片段（知识库问答）",
+		Args: `{"query":"KV cache 显存怎么算","k":3}`,
+		Run:  docSearch,
+	},
 	"now": {
 		Name: "now",
 		Desc: "返回当前时间（RFC3339，UTC）",
@@ -329,7 +344,7 @@ func runAgent(ctx context.Context, history []llmMsg) (string, error) {
 		if terr != nil {
 			res = "工具执行失败: " + terr.Error()
 		}
-		log.Printf("step %d tool=%s result=%s", step, tc.Tool, res)
+		log.Printf("step %d tool=%s result=%s", step, tc.Tool, shorten(res, 120))
 		history = append(history, llmMsg{Role: "user", Content: "工具结果: " + res})
 	}
 	return "", fmt.Errorf("too many tool steps")
@@ -495,7 +510,7 @@ func runAgentStream(ctx context.Context, history []llmMsg, sseSend func(any)) (s
 			}
 			res = "工具执行失败: " + terr.Error()
 		}
-		log.Printf("stream step %d tool=%s result=%s", step, tc.Tool, res)
+		log.Printf("stream step %d tool=%s result=%s", step, tc.Tool, shorten(res, 120))
 		sseSend(map[string]any{"tool": tc.Tool, "result": res})
 
 		history = append(history, llmMsg{Role: "user", Content: "工具结果: " + res})
@@ -561,6 +576,11 @@ func chatStreamHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initRedis()
+	if err := index.rebuild(); err != nil {
+		log.Println("index rebuild:", err)
+	} else {
+		log.Printf("doc index ready: %d chunks (dir=%s)", len(index.chunks), index.docDir)
+	}
 
 	mux := http.NewServeMux()
 
@@ -580,6 +600,19 @@ func main() {
 			"llm_base_url": llmBaseURL,
 			"model":        llmModel,
 		})
+	})
+
+	mux.HandleFunc("/reindex", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := index.rebuild(); err != nil {
+			http.Error(w, "reindex: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "chunks": len(index.chunks)})
 	})
 
 	mux.HandleFunc("/chat", chatHandler)

@@ -47,6 +47,7 @@ python bench.py -c 1,4,8,16 -n 8
 | GET | `/health` | 依赖健康（Redis + vLLM） |
 | POST | `/chat` | 非流式，返回完整回答 |
 | POST | `/chat/stream` | SSE 流式，带工具进度事件 |
+| POST | `/reindex` | 重建文档检索索引，返回 chunk 数 |
 
 请求体：
 
@@ -91,6 +92,17 @@ chatHandler / chatStreamHandler
 | Prompt | `systemPrompt()` + `toolsPrompt()` | 工具清单由注册表自动生成 |
 | 工具循环 | `runAgent` / `runAgentStream` | 非流式 / 流式两种实现 |
 | HTTP | `main()` | 路由 + Server（`ReadHeaderTimeout`） |
+
+## 内置工具
+
+| 工具 | 作用 |
+|---|---|
+| `doc_search` | BM25 检索 `docs/` 下的 Markdown/文本，返回带来源的片段 |
+| `now` | 当前时间（RFC3339） |
+| `kv_count` | Redis list 长度 |
+| `redis_get` | 读取 Redis 字符串值 |
+
+检索用中文 bigram 分词 + BM25，零依赖、可解释；升级成向量检索只需替换 `rag.go` 里的打分函数，索引结构不变。
 
 ## 加一个新工具
 
@@ -138,7 +150,7 @@ chatHandler / chatStreamHandler
 
 ## Roadmap
 
-- [ ] 文件检索工具（RAG）+ 前缀白名单
+- [x] 文件检索工具（RAG，BM25）\n- [ ] 向量检索 + 重排
 - [ ] 30 条评测集与指标（成功率 / 引用命中 / P95 / 单任务成本）
 - [ ] 工具执行进度事件
 - [ ] 结构化日志与 Prometheus 指标

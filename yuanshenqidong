@@ -1,0 +1,4 @@
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate /data/ywb/envs/agent
+fuser -k 18080/tcp
+go run main.go
